@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASCII 波形动画</title>
+<style>
+  body {
+    margin: 0; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; background: #ececec; font-family: system-ui, sans-serif;
+  }
+  canvas {
+    width: 640px; height: 460px;          /* 320×230 放大 2 倍显示 */
+    image-rendering: pixelated;
+    background: #fff; border-radius: 8px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.15);
+    cursor: crosshair;
+  }
+  canvas:focus { outline: 3px solid #212121; outline-offset: 2px; }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button {
+    padding: 6px 14px; border: 1px solid #212121; background: #fff;
+    border-radius: 6px; cursor: pointer; font-size: 14px;
+  }
+  button:hover { background: #212121; color: #fff; }
+  label { font-size: 14px; }
+  .hint { color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+  <canvas id="wave" width="320" height="230" tabindex="0" aria-label="ASCII 波形动画"></canvas>
+  <div class="controls">
+    <button id="play">▶ 播放（从头）</button>
+    <button id="pause">⏸ 暂停</button>
+    <button id="resume">⏯ 继续</button>
+    <label><input type="checkbox" id="autoflow" checked> 自动流动（详情页）</label>
+  </div>
+  <div class="hint">移动指针产生局部扰动；Tab 聚焦画布也可播放；暂停冻结相位、继续接续进度。</div>
+
+<script>
+(function () {
+  // ---- 配置（对应 Ariadne asciiSettings，字段名与源码一致）----
+  const SETTINGS = {
+    characters: 'cyslap',
+    opacity: 0.77,
+    fontSize: 6.8,
+    density: 1.1,
+    speed: 1.5,          // 时钟倍率
+    direction: 65,       // 流场旋转角度（度）
+    twist: 2,            // 扭曲
+    tension: 0.4,        // 波形紧密度
+    color: '#212121',
+    pointerStrength: 1,  // 指针扰动强度
+    pointerRadius: 100   // 影响半径（px，320×230 逻辑坐标）
+  };
+  const DURATION_MS = 4000;   // asciiPhase 0 → 2π 用时 4s
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const canvas = document.getElementById('wave');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;   // 320 × 230
+
+  // ---- 状态 ----
+  let phase = 0;             // 累计相位（单调递增，回绕连续）
+  let flowing = false;
+  let paused = false;
+  let manualPlay = false;
+  let pointerInside = false;
+  let focused = false;
+  const pointer = { x: -1e3, y: -1e3, vx: 0, vy: 0, energy: 0, inside: false };
+
+  const autoflowEl = document.getElementById('autoflow');
+  const autoFlow = () => autoflowEl.checked;
+
+  // ---- 控制按钮 ----
+  document.getElementById('play').onclick = () => {   // 从头播放
+    paused = false; manualPlay = true; phase = 0;
+  };
+  document.getElementById('pause').onclick = () => {  // 暂停：冻结相位
+    paused = true; manualPlay = false;
+  };
+  document.getElementById('resume').onclick = () => { // 继续：接续当前相位
+    paused = false; manualPlay = true;
+  };
+
+  // ---- 键盘聚焦 ----
+  canvas.addEventListener('focus', () => { focused = true; });
+  canvas.addEventListener('blur', () => { focused = false; });
+
+  // ---- 指针（进入 / 移动 / 离开），坐标转到 320×230 逻辑空间 ----
+  function toLocal(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+  }
+  canvas.addEventListener('pointerenter', (e) => {
+    const p = toLocal(e);
+    pointer.x = p.x; pointer.y = p.y; pointer.inside = true; pointerInside = true;
+    if (!flowing) phase = 0;   // 从静止重新进入 → 从头开始
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    const p = toLocal(e);
+    if (pointer.inside) {
+      pointer.vx = p.x - pointer.x;
+      pointer.vy = p.y - pointer.y;
+      pointer.energy = Math.min(1, pointer.energy + Math.hypot(pointer.vx, pointer.vy) * 0.04);
+    }
+    pointer.x = p.x; pointer.y = p.y; pointer.inside = true; pointerInside = true;
+  });
+  canvas.addEventListener('pointerleave', () => {
+    pointer.inside = false; pointerInside = false; pointer.energy = 0;   // 离开：冻结 + 清除扰动
+  });
+
+  // ---- 移植自 Ariadne asciiPaintCode / Hk ----
+  function paintAscii() {
+    const chars = Array.from(SETTINGS.characters);
+    const time = phase * (2 / Math.PI) * SETTINGS.speed;   // s = t*4/(2π)*speed
+    const cellW = Math.max(2.6, SETTINGS.fontSize * 1.2 / SETTINGS.density);
+    const cellH = Math.max(3.2, SETTINGS.fontSize * 1.4 / SETTINGS.density);
+    const u = 0.72 + SETTINGS.tension * 0.56;
+    const d = 49 / (0.86 + SETTINGS.tension * 0.34);
+    const rot = SETTINGS.direction * Math.PI / 180;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = SETTINGS.fontSize + 'px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = SETTINGS.color;
+
+    for (let rowY = -cellH * 2; rowY < H + cellH * 2; rowY += cellH) {
+      for (let colX = -cellW * 2; colX < W + cellW * 2; colX += cellW) {
+        let mx = colX, my = rowY;          // 流场采样坐标
+        let drawX = colX, drawY = rowY;    // 绘制坐标
+
+        if (pointer.energy > 0 && SETTINGS.pointerStrength > 0) {
+          const dx = colX - pointer.x, dy = rowY - pointer.y;
+          const gauss = Math.exp(-(dx * dx + dy * dy) / (SETTINGS.pointerRadius ** 2 * 1.9))
+                      * pointer.energy * SETTINGS.pointerStrength;
+          const wobble = gauss * (Math.sin(dx * 0.047 + dy * 0.023 - time * 2.55) * 52
+                        + Math.cos(dy * 0.041 - dx * 0.019 + time * 2.18) * 24);
+          const gauss184 = gauss * 184;
+          const dispX = -pointer.vx * gauss184 - pointer.vy * wobble;
+          const dispY = -pointer.vy * gauss184 + pointer.vx * wobble;
+          mx += dispX; my += dispY;
+          drawX += Math.tanh(dispX / 28) * cellW * 1.6;
+          drawY += Math.tanh(dispY / 28) * cellH * 1.45;
+        }
+
+        const twistAngle = rot + SETTINGS.twist * (
+          Math.sin((mx + my) * 0.0032 + time * 0.11) * 0.72
+          + Math.cos(my * 0.0044 - mx * 0.0017 - time * 0.08) * 0.38
+        );
+        const y = (mx - W / 2) * Math.cos(twistAngle) - (my - H / 2) * Math.sin(twistAngle) + W / 2;
+        const b = (mx - W / 2) * Math.sin(twistAngle) + (my - H / 2) * Math.cos(twistAngle) + H / 2;
+
+        const x = Math.sin(b * 0.009 * u - time * 0.42) * d + Math.cos(b * 0.004 * u + time * 0.25) * d * 0.44;
+        const S = Math.sin((y + x) * 0.036 * u + time * 0.35);
+        const C = Math.sin((y * 0.61 - b * 0.48 + Math.sin(b * 0.014 * u - time * 0.18) * 26) * 0.044 * u - time * 0.27);
+        const w = Math.sin((y * 0.34 + b * 0.72 + Math.cos(y * 0.009 * u + time * 0.12) * 24) * 0.052 * u + time * 0.21);
+        const T = Math.sin(y * 0.11 * u + b * 0.067 * u + time * 0.48) * 0.09
+                + Math.cos(b * 0.093 * u - y * 0.041 * u - time * 0.36) * 0.06;
+        const E = S * 0.28 + C * 0.24 + w * 0.22 + Math.sin((y - b * 0.21) * 0.018 * u + time * 0.3) * 0.26;
+        const D = Math.max(0.03, Math.min(0.98, 0.52 + E * 0.35 + T));
+
+        const a0 = Math.max(0.04, Math.min(0.95, 0.2 + D * 0.43 + (D - 0.5) * 0.1));
+        ctx.globalAlpha = SETTINGS.opacity * (Math.round(a0 * 20) / 20);
+        ctx.fillText(chars[Math.min(chars.length - 1, Math.floor(D * chars.length))], drawX, drawY);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- 主循环 ----
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(50, now - last);
+    last = now;
+
+    if (reducedMotion) {
+      phase = 0; pointer.energy = 0;   // 减少动态：静态目标帧
+      flowing = false;
+    } else {
+      flowing = !paused && (pointerInside || focused || autoFlow() || manualPlay);
+      if (flowing) {
+        phase += (Math.PI * 2) * (dt / DURATION_MS);
+      }
+      if (pointer.inside) pointer.energy *= 0.94; else pointer.energy = 0;
+    }
+
+    paintAscii();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
